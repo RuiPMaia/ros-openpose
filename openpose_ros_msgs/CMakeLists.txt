@@ -17,10 +17,15 @@ add_message_files(
   BodyPartDetection.msg
   PersonDetection.msg
   Persons.msg
+  BodyPartDetection_3d.msg
+  PersonDetection_3d.msg
+  Persons_3d.msg
+  BoundingBox.msg
+  BBList.msg
 )
 
 generate_messages(
-  DEPENDENCIES std_msgs
+  DEPENDENCIES std_msgs 
 )
 
 catkin_package(

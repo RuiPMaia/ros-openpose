@@ -86,7 +86,7 @@ DEFINE_int32(keypoint_scale,            0,              "Scaling of the (x,y) co
 DEFINE_string(model_pose,               "COCO",         "Model to be used (e.g. COCO, MPI, MPI_4_layers).");
 DEFINE_string(net_resolution,           "320x320",      "Multiples of 16. If it is increased, the accuracy usually increases. If it is decreased,"
                                                         " the speed increases.");
-DEFINE_int32(num_scales,                1,              "Number of scales to average.");
+DEFINE_int32(scale_number,                1,              "Number of scales to average.");
 DEFINE_double(scale_gap,                0.3,            "Scale gap between scales. No effect unless num_scales>1. Initial scale is always 1. If you"
                                                         " want to change the initial scale, you actually want to multiply the `net_resolution` by"
                                                         " your desired initial scale.");
@@ -117,6 +117,10 @@ DEFINE_int32(render_pose,               1,              "Set to 0 for no renderi
                                                         " (slower but greater functionality, e.g. `alpha_X` flags). If rendering is enabled, it will"
                                                         " render both `outputData` and `cvOutputData` with the original image and desired body part"
                                                         " to be shown (i.e. keypoints, heat maps or PAFs).");
+DEFINE_double(render_threshold,         0.05,           "Only estimated keypoints whose score confidences are higher than this threshold will be"
+                                                        " rendered. Generally, a high threshold (> 0.5) will only render very clear body parts;"
+                                                        " while small thresholds (~0.1) will also output guessed and occluded keypoints, but also"
+                                                        " more false positives (i.e. wrong detections).");
 DEFINE_double(alpha_pose,               0.6,            "Blending factor (range 0-1) for the body part rendering. 1 will show it completely, 0 will"
                                                         " hide it. Only valid for GPU rendering.");
 DEFINE_double(alpha_heatmap,            0.7,            "Blending factor (range 0-1) between heatmap and original frame. 1 will only show the"
@@ -154,7 +158,7 @@ DEFINE_string(write_heatmaps,           "",             "Directory to write heat
 DEFINE_string(write_heatmaps_format,    "png",          "File extension and format for `write_heatmaps`, analogous to `write_images_format`."
                                                         " Recommended `png` or any compressed and lossless format.");
 
-DEFINE_string(result_image_topic,              "",          "topic name for publish processed/annotated image(usefule for debugging)");
+DEFINE_string(result_image_topic,              "",          "topic name for publish processed/annotated image(useful for debugging)");
 
 op::PoseModel gflagToPoseModel(const std::string& poseModeString)
 {
@@ -264,25 +268,19 @@ op::Point<int> netInputSize;
 op::Point<int> netOutputSize;
 op::Point<int> faceNetInputSize;
 op::Point<int> handNetInputSize;
-op::PoseModel poseModel;
 op::ScaleMode keypointScale;
+op::PoseModel poseModel;
 std::vector<op::HeatMapType> heatMapTypes;
 
-op::CvMatToOpInput *cvMatToOpInput;
-op::CvMatToOpOutput *cvMatToOpOutput;
-op::PoseExtractorCaffe *poseExtractorCaffe;
-op::PoseRenderer *poseRenderer;
-op::FaceDetector *faceDetector;
-op::FaceExtractor *faceExtractor;
-op::FaceRenderer *faceRenderer;
-op::OpOutputToCvMat *opOutputToCvMat;
+std::shared_ptr<op::PoseExtractorCaffe> poseExtractorCaffe;
+std::shared_ptr<op::PoseGpuRenderer> poseRenderer;
 
 int init_openpose()
 {
     // logging_level
     op::check(0 <= FLAGS_logging_level && FLAGS_logging_level <= 255, "Wrong logging_level value.", __LINE__, __FUNCTION__, __FILE__);
     op::ConfigureLog::setPriorityThreshold((op::Priority)FLAGS_logging_level);
-    // op::ConfigureLog::setPriorityThreshold(op::Priority::None); // To print all logging messages
+    op::ConfigureLog::setPriorityThreshold(op::Priority::None); // To print all logging messages
 
     const auto timerBegin = std::chrono::high_resolution_clock::now();
 
@@ -290,21 +288,17 @@ int init_openpose()
     std::tie(outputSize, netInputSize, faceNetInputSize, handNetInputSize, poseModel, keypointScale,
              heatMapTypes) = gflagsToOpParameters();
     netOutputSize = netInputSize;
-
+    // Enabling Google Logging
+    const bool enableGoogleLogging = true;
     // Initialize
-    cvMatToOpInput = new op::CvMatToOpInput(netInputSize, FLAGS_num_scales, (float)FLAGS_scale_gap);
-    cvMatToOpOutput = new op::CvMatToOpOutput(outputSize);
-    poseExtractorCaffe = new op::PoseExtractorCaffe(netInputSize, netOutputSize, outputSize, FLAGS_num_scales, poseModel, FLAGS_model_folder, FLAGS_num_gpu_start);
-    poseRenderer = new op::PoseRenderer(netOutputSize, outputSize, poseModel, nullptr, !FLAGS_disable_blending, (float)FLAGS_alpha_pose);
-    faceDetector = new op::FaceDetector(poseModel);
-    faceExtractor = new op::FaceExtractor(faceNetInputSize, faceNetInputSize, FLAGS_model_folder, FLAGS_num_gpu_start);
-    faceRenderer = new op::FaceRenderer(netOutputSize, (float)FLAGS_alpha_pose, (float) 0.7);
-    opOutputToCvMat = new op::OpOutputToCvMat(outputSize);
+    poseExtractorCaffe = std::make_shared<op::PoseExtractorCaffe>(poseModel, FLAGS_model_folder, FLAGS_num_gpu_start, std::vector<op::HeatMapType>{}, op::ScaleMode::ZeroToOne,
+      enableGoogleLogging);
 
+    poseRenderer = std::make_shared<op::PoseGpuRenderer>(poseModel, poseExtractorCaffe, (float)FLAGS_render_threshold, !FLAGS_disable_blending, (float)FLAGS_alpha_pose,
+      (float)FLAGS_alpha_heatmap);
+    poseRenderer->setElementToRender(FLAGS_part_to_show);
     poseExtractorCaffe->initializationOnThread();
     poseRenderer->initializationOnThread();
-    faceExtractor->initializationOnThread();
-    faceRenderer->initializationOnThread();
 
     // Measuring total time
     const auto now = std::chrono::high_resolution_clock::now();
@@ -316,8 +310,15 @@ int init_openpose()
 }
 
 void imageCallback(const sensor_msgs::ImageConstPtr& msg) {
-    ros::Time t = ros::Time::now();
 
+    op::ScaleAndSizeExtractor scaleAndSizeExtractor(netInputSize, outputSize, FLAGS_scale_number, FLAGS_scale_gap);
+    op::CvMatToOpInput cvMatToOpInput;
+    op::CvMatToOpOutput cvMatToOpOutput;
+    op::OpOutputToCvMat opOutputToCvMat;
+
+    ros::Time t = ros::Time::now();
+    // ------------------------- POSE ESTIMATION AND RENDERING ------------------------
+    // Step 1 - Read and load image, error if empty (possibly wrong path)
     cv_bridge::CvImagePtr cv_ptr;
     try {
         cv_ptr = cv_bridge::toCvCopy(msg, "bgr8");
@@ -326,27 +327,42 @@ void imageCallback(const sensor_msgs::ImageConstPtr& msg) {
     }
     if (cv_ptr->image.empty()) return;
 
-    op::Array<float> netInputArray;
-    std::vector<float> scaleRatios;
-    op::Array<float> outputArray;
-
-    // process
-    std::tie(netInputArray, scaleRatios) = cvMatToOpInput->format(cv_ptr->image);
+    const op::Point<int> imageSize{cv_ptr->image.cols, cv_ptr->image.rows};
+    // Step 2 - Get desired scale sizes
+    std::vector<double> scaleInputToNetInputs;
+    std::vector<op::Point<int>> netInputSizes;
     double scaleInputToOutput;
-    std::tie(scaleInputToOutput, outputArray) = cvMatToOpOutput->format(cv_ptr->image);
-    // Step 3 - Estimate poseKeypoints
-    poseExtractorCaffe->forwardPass(netInputArray, {cv_ptr->image.cols, cv_ptr->image.rows}, scaleRatios);
+    op::Point<int> outputResolution;
+    std::tie(scaleInputToNetInputs, netInputSizes, scaleInputToOutput, outputResolution) = scaleAndSizeExtractor.extract(imageSize);
+    // Step 3 - Format input image to OpenPose input and output formats
+    const auto netInputArray = cvMatToOpInput.createArray(cv_ptr->image, scaleInputToNetInputs, netInputSizes);
+    auto outputArray = cvMatToOpOutput.createArray(cv_ptr->image, scaleInputToOutput, outputResolution);
+    // Step 4 - Estimate poseKeypoints
+    poseExtractorCaffe->forwardPass(netInputArray, imageSize, scaleInputToNetInputs);
     const auto poseKeypoints = poseExtractorCaffe->getPoseKeypoints();
-    const auto faces = faceDetector->detectFaces(poseKeypoints, scaleInputToOutput);
-    faceExtractor->forwardPass(faces, cv_ptr->image, scaleInputToOutput);
-    const auto faceKeypoints = faceExtractor->getFaceKeypoints();
+    const auto scaleNetToOutput = poseExtractorCaffe->getScaleNetToOutput();
 
+    if (!FLAGS_result_image_topic.empty()) {
+        // Step 5 - Render poseKeypoints
+        poseRenderer->renderPose(outputArray, poseKeypoints, scaleInputToOutput, scaleNetToOutput);
+        // Step 6 - OpenPose output format to cv::Mat
+        auto outputImage = opOutputToCvMat.formatToCvMat(outputArray);
+        // publish result image with annotation.
+        sensor_msgs::ImagePtr out_msg;
+        if(FLAGS_part_to_show == 21 && FLAGS_disable_blending == true){
+           cv::Mat grayMat;
+           cvtColor(outputImage, grayMat, cv::COLOR_RGB2GRAY);
+           out_msg = cv_bridge::CvImage(msg->header, "mono8", grayMat).toImageMsg();
+        } else
+           out_msg = cv_bridge::CvImage(msg->header, "bgr8", outputImage).toImageMsg();
+        publish_result.publish(out_msg);
+    }
     // publish annotations.
     openpose_ros_msgs::Persons persons;
-    persons.rostime = t;
+    persons.header = msg->header;
     persons.image_w = outputSize.x;
     persons.image_h = outputSize.y;
-    
+
     const int num_people = poseKeypoints.getSize(0);
     const int num_bodyparts = poseKeypoints.getSize(1);
 
@@ -364,17 +380,6 @@ void imageCallback(const sensor_msgs::ImageConstPtr& msg) {
         persons.persons.push_back(person);
     }
     publish_pose.publish(persons);
-
-    // publish result image with annotation.
-    if (!FLAGS_result_image_topic.empty()) {
-        poseRenderer->renderPose(outputArray, poseKeypoints);
-        faceRenderer->renderFace(outputArray, faceKeypoints);
-
-        auto outputImage = opOutputToCvMat->formatToCvMat(outputArray);
-
-        sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", outputImage).toImageMsg();
-        publish_result.publish(msg);
-    }
 }
 
 int main(int argc, char *argv[])
@@ -384,18 +389,25 @@ int main(int argc, char *argv[])
 
     FLAGS_resolution = getParam(local_nh, "resolution", std::string("640x480"));
     FLAGS_num_gpu = getParam(local_nh, "num_gpu", -1);
-    FLAGS_num_gpu_start = getParam(local_nh, "num_gpu_start", 1);
+    FLAGS_num_gpu_start = getParam(local_nh, "num_gpu_start", 0);
     FLAGS_model_pose = getParam(local_nh, "model_pose", std::string("COCO"));
     FLAGS_net_resolution = getParam(local_nh, "net_resolution", std::string("640x480"));
     FLAGS_face = getParam(local_nh, "face", false);
     FLAGS_no_display = getParam(local_nh, "no_display", false);
+
+    FLAGS_scale_number = getParam(local_nh, "scale_number", 1);
+    FLAGS_scale_gap = getParam(local_nh, "scale_gap", 0.3);
+    FLAGS_model_folder = getParam(local_nh, "model_folder", std::string(std::getenv("OPENPOSE_HOME")) + std::string("/models/"));
+    FLAGS_render_threshold = getParam(local_nh, "render_threshold", 0.05);
+    FLAGS_part_to_show = getParam(local_nh, "part_to_show", 0);
+    FLAGS_disable_blending = getParam(local_nh, "disable_blending", false);
 
     std::string camera_src = getParam(local_nh, "camera", std::string("/camera/image"));
     FLAGS_result_image_topic = getParam(local_nh, "result_image_topic", std::string(""));
 
     // prepare model
     init_openpose();
-  
+
     // subscribe image
     ros::NodeHandle nh;
     image_transport::ImageTransport img_t(nh);
@@ -406,5 +418,5 @@ int main(int argc, char *argv[])
     publish_pose = nh.advertise<openpose_ros_msgs::Persons>("/openpose/pose", 1);
 
     ros::spin();
-    return 0; 
+    return 0;
 }
